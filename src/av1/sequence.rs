@@ -116,8 +116,55 @@ impl SequenceHeader {
     }
 }
 
-/// Parse a sequence header OBU payload.
+/// Parse sequence header syntax from an OBU payload prefix.
+///
+/// This does not validate trailing bits or require the payload to end after the
+/// sequence header. Use [`parse_sequence_header_obu_complete`] for a complete
+/// externally bounded OBU payload. The returned header does not borrow `payload`.
 pub fn parse_sequence_header_obu(payload: &[u8]) -> Result<SequenceHeader, BitstreamError> {
+    parse_sequence_header_syntax(payload).map(|(header, _)| header)
+}
+
+/// Parse a complete sequence header OBU payload and validate its trailing bits.
+///
+/// `payload` excludes the OBU header, extension header and size field. The tuple
+/// contains the owned header and the number of syntax bits before trailing bits,
+/// measured from payload bit zero. The offset excludes the mandatory one marker
+/// and all zero padding, and is strictly less than the payload's bit length.
+/// Extra zero bytes after the marker are accepted. The header does not borrow
+/// `payload`; validation adds no payload copy or collection.
+///
+/// Returns [`BitstreamError::UnexpectedEnd`] for truncated syntax or an absent
+/// marker position, and [`BitstreamError::InvalidData`] for a zero marker,
+/// nonzero padding or an unrepresentable payload bit length. Syntax errors are
+/// the same as in [`parse_sequence_header_obu`].
+pub fn parse_sequence_header_obu_complete(
+    payload: &[u8],
+) -> Result<(SequenceHeader, usize), BitstreamError> {
+    payload
+        .len()
+        .checked_mul(8)
+        .ok_or_else(|| BitstreamError::invalid("AV1 sequence payload bit length overflow"))?;
+    let (header, syntax_bits) = parse_sequence_header_syntax(payload)?;
+    let (&byte, remaining_bytes) = payload
+        .get(syntax_bits / 8..)
+        .and_then(|remaining| remaining.split_first())
+        .ok_or_else(|| BitstreamError::unexpected_end("AV1 sequence trailing marker"))?;
+    let marker = 0x80_u8 >> (syntax_bits % 8);
+    if byte & marker == 0 {
+        return Err(BitstreamError::invalid(
+            "AV1 sequence trailing marker is zero",
+        ));
+    }
+    if byte & (marker - 1) != 0 || remaining_bytes.iter().any(|&byte| byte != 0) {
+        return Err(BitstreamError::invalid(
+            "AV1 sequence trailing padding is nonzero",
+        ));
+    }
+    Ok((header, syntax_bits))
+}
+
+fn parse_sequence_header_syntax(payload: &[u8]) -> Result<(SequenceHeader, usize), BitstreamError> {
     let mut r = BitReader::new(payload);
     let mut s = SequenceHeader {
         seq_profile: r.u(3) as u8,
@@ -245,7 +292,7 @@ pub fn parse_sequence_header_obu(payload: &[u8]) -> Result<SequenceHeader, Bitst
     if r.bit_pos() > r.total_bits() {
         return Err(BitstreamError::unexpected_end("AV1 sequence header"));
     }
-    Ok(s)
+    Ok((s, r.bit_pos()))
 }
 
 fn color_config(r: &mut BitReader<'_>, profile: u8) -> Av1ColorConfig {
