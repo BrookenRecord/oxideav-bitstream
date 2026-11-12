@@ -211,9 +211,11 @@ impl SliceSegmentHeader {
         (st + lt) as u32
     }
 
-    /// `SliceQpY` (eq. 7-54).
+    /// `SliceQpY` (eq. 7-54). Hand-built invalid fields whose sum
+    /// exceeds i32 saturate; parsers reject out-of-range QP values.
     pub fn slice_qp_y(&self, pps: &HevcPps) -> i32 {
-        26 + pps.init_qp_minus26 + self.slice_qp_delta
+        let qp = 26 + i64::from(pps.init_qp_minus26) + i64::from(self.slice_qp_delta);
+        qp.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
     }
 
     /// Offset of the first slice data byte in the escaped NAL unit
@@ -276,7 +278,8 @@ pub fn peek_slice_pps_id(nal: &[u8]) -> Result<u8, BitstreamError> {
 /// Parse a complete slice segment header from a whole NAL unit (2-byte
 /// header first, emulation prevention bytes in place). `prev` is the
 /// preceding independent slice segment header of the same picture; it
-/// is required for a dependent slice segment.
+/// is required for a dependent slice segment. Returns `Unsupported` if
+/// a non-first segment needs a slice address wider than 32 bits.
 pub fn parse_slice_segment_header(
     nal: &[u8],
     sps: &HevcSps,
@@ -340,7 +343,13 @@ pub fn parse_slice_segment_header(
             h.dependent_slice_segment_flag = r.u(1) != 0;
         }
         let ctbs = pic_size_in_ctbs(sps)?;
-        h.slice_segment_address = r.u(ceil_log2(ctbs));
+        let address_bits = ceil_log2(ctbs);
+        if address_bits > 32 {
+            return Err(BitstreamError::unsupported(
+                "slice_segment_address wider than 32 bits",
+            ));
+        }
+        h.slice_segment_address = r.u(address_bits);
         if u64::from(h.slice_segment_address) >= ctbs {
             return Err(BitstreamError::invalid(
                 "slice_segment_address beyond the picture",
@@ -421,7 +430,13 @@ pub fn parse_slice_segment_header(
             "byte_alignment() without its one bit",
         ));
     }
-    r.align_to_byte();
+    while !r.byte_aligned() {
+        if r.u(1) != 0 {
+            return Err(BitstreamError::invalid(
+                "byte_alignment() with nonzero padding",
+            ));
+        }
+    }
     check_end(&r, "byte_alignment")?;
     h.header_bytes = r.bit_pos() / 8;
     h.header_emulation_bytes =
@@ -496,7 +511,7 @@ fn parse_independent(
                 }
             }
             h.num_long_term_pics = r.ue()?;
-            if h.num_long_term_sps + h.num_long_term_pics > 32 {
+            if h.num_long_term_sps > 32 || h.num_long_term_pics > 32 - h.num_long_term_sps {
                 return Err(BitstreamError::invalid("too many long-term pictures"));
             }
             let poc_bits = u32::from(sps.log2_max_pic_order_cnt_lsb_minus4) + 4;
@@ -626,8 +641,8 @@ fn parse_independent(
     }
     h.slice_qp_delta = r.se()?;
     let qp_bd = 6 * i32::from(sps.bit_depth_luma_minus8);
-    let qp = h.slice_qp_y(pps);
-    if !(-qp_bd..=51).contains(&qp) {
+    let qp = 26 + i64::from(pps.init_qp_minus26) + i64::from(h.slice_qp_delta);
+    if !(-i64::from(qp_bd)..=51).contains(&qp) {
         return Err(BitstreamError::invalid(format!("SliceQpY={qp}")));
     }
     if pps.pps_slice_chroma_qp_offsets_present_flag {
@@ -695,7 +710,7 @@ fn parse_pred_weight_table(
     let chroma = chroma_array_type != 0;
     if chroma {
         t.delta_chroma_log2_weight_denom = r.se()?;
-        let c = t.luma_log2_weight_denom as i32 + t.delta_chroma_log2_weight_denom;
+        let c = i64::from(t.luma_log2_weight_denom) + i64::from(t.delta_chroma_log2_weight_denom);
         if !(0..=7).contains(&c) {
             return Err(BitstreamError::invalid(
                 "ChromaLog2WeightDenom outside 0..=7",

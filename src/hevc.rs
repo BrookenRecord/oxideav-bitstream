@@ -395,6 +395,9 @@ pub(crate) fn parse_st_ref_pic_set_body(
         }
         let delta_rps = (1 - 2 * delta_rps_sign as i64) as i32 * (abs_delta_rps_minus1 as i32 + 1);
         let num_delta = ref_rps.num_delta_pocs();
+        if num_delta > max_dec_pic_buffering_minus1 as usize {
+            return Err(BitstreamError::invalid("reference RPS exceeds DPB limit"));
+        }
         let mut used_by_curr = vec![false; num_delta + 1];
         let mut use_delta = vec![true; num_delta + 1];
         for j in 0..=num_delta {
@@ -450,6 +453,9 @@ pub(crate) fn parse_st_ref_pic_set_body(
                 out.delta_poc_s1.push(d_poc);
                 out.used_by_curr_pic_s1.push(used_by_curr[ref_neg + j]);
             }
+        }
+        if out.num_delta_pocs() > max_dec_pic_buffering_minus1 as usize {
+            return Err(BitstreamError::invalid("derived RPS exceeds DPB limit"));
         }
         Ok(out)
     } else {
@@ -1459,6 +1465,8 @@ fn write_profile_tier_level(
 // ─────────────────────────── Parsers ─────────────────────────────────────────
 
 /// Parse a VPS NAL (with two-byte NAL header at index 0..1).
+/// Requires complete syntax and RBSP trailing bits. Unknown extension-data
+/// bits remain opaque when their extension flag is set.
 pub fn parse_vps_nal(nal: &[u8]) -> Result<HevcVps, BitstreamError> {
     if nal.len() < 2 {
         return Err(BitstreamError::unexpected_end(
@@ -1577,12 +1585,14 @@ pub fn parse_vps_nal(nal: &[u8]) -> Result<HevcVps, BitstreamError> {
         }
     }
     vps.vps_extension_flag = r.u(1) != 0;
-    // vps_extension() payload (Annex F) is not decoded; the remaining
-    // bits are extension data + rbsp_trailing_bits.
+    // vps_extension() payload (Annex F) remains opaque.
+    r.finish_rbsp(vps.vps_extension_flag)?;
     Ok(vps)
 }
 
 /// Parse an SPS NAL (with two-byte NAL header at index 0..1).
+/// Requires complete syntax and RBSP trailing bits. Unknown extension-data
+/// bits remain opaque when their extension flag is set.
 pub fn parse_sps_nal(nal: &[u8]) -> Result<HevcSps, BitstreamError> {
     if nal.len() < 2 {
         return Err(BitstreamError::unexpected_end(
@@ -1610,8 +1620,8 @@ pub fn parse_sps_nal(nal: &[u8]) -> Result<HevcSps, BitstreamError> {
         ));
     }
     sps.profile_tier_level = parse_profile_tier_level(&mut r, true, sps.sps_max_sub_layers_minus1)?;
-    sps.sps_seq_parameter_set_id = r.ue()? as u8;
-    sps.chroma_format_idc = r.ue()? as u8;
+    sps.sps_seq_parameter_set_id = r.ue_max(15, "SPS sps_seq_parameter_set_id")? as u8;
+    sps.chroma_format_idc = r.ue_max(3, "SPS chroma_format_idc")? as u8;
     if sps.chroma_format_idc == 3 {
         sps.separate_colour_plane_flag = r.u(1) != 0;
     }
@@ -1626,8 +1636,8 @@ pub fn parse_sps_nal(nal: &[u8]) -> Result<HevcSps, BitstreamError> {
             bottom: r.ue()?,
         });
     }
-    sps.bit_depth_luma_minus8 = r.ue()? as u8;
-    sps.bit_depth_chroma_minus8 = r.ue()? as u8;
+    sps.bit_depth_luma_minus8 = r.ue_max(8, "SPS bit_depth_luma_minus8")? as u8;
+    sps.bit_depth_chroma_minus8 = r.ue_max(8, "SPS bit_depth_chroma_minus8")? as u8;
     // H.265 §7.4.3.2.1 constrains log2_max_pic_order_cnt_lsb_minus4 to
     // 0..=12 (slice_pic_order_cnt_lsb is read as u(value + 4), i.e. at
     // most 16 bits). A larger value from a malformed SPS would later
@@ -1689,10 +1699,26 @@ pub fn parse_sps_nal(nal: &[u8]) -> Result<HevcSps, BitstreamError> {
     }
     sps.log2_min_luma_coding_block_size_minus3 = log2_min_cb_minus3 as u8;
     sps.log2_diff_max_min_luma_coding_block_size = log2_diff_cb as u8;
-    sps.log2_min_luma_transform_block_size_minus2 = r.ue()? as u8;
-    sps.log2_diff_max_min_luma_transform_block_size = r.ue()? as u8;
-    sps.max_transform_hierarchy_depth_inter = r.ue()? as u8;
-    sps.max_transform_hierarchy_depth_intra = r.ue()? as u8;
+    // §7.4.3.2.1: MinTbLog2SizeY <= min(MinCbLog2SizeY, 5).
+    let min_tb_minus2 = r.ue_max(
+        3u32.min(log2_min_cb_minus3 + 1),
+        "SPS log2_min_luma_transform_block_size_minus2",
+    )?;
+    let min_tb_log2 = min_tb_minus2 + 2;
+    sps.log2_min_luma_transform_block_size_minus2 = min_tb_minus2 as u8;
+    sps.log2_diff_max_min_luma_transform_block_size = r.ue_max(
+        5u32.min(ctb_log2 as u32) - min_tb_log2,
+        "SPS log2_diff_max_min_luma_transform_block_size",
+    )? as u8;
+    let max_hierarchy_depth = ctb_log2 as u32 - min_tb_log2;
+    sps.max_transform_hierarchy_depth_inter = r.ue_max(
+        max_hierarchy_depth,
+        "SPS max_transform_hierarchy_depth_inter",
+    )? as u8;
+    sps.max_transform_hierarchy_depth_intra = r.ue_max(
+        max_hierarchy_depth,
+        "SPS max_transform_hierarchy_depth_intra",
+    )? as u8;
 
     sps.scaling_list_enabled_flag = r.u(1) != 0;
     if sps.scaling_list_enabled_flag {
@@ -1707,8 +1733,16 @@ pub fn parse_sps_nal(nal: &[u8]) -> Result<HevcSps, BitstreamError> {
     if sps.pcm_enabled_flag {
         sps.pcm_sample_bit_depth_luma_minus1 = r.u(4) as u8;
         sps.pcm_sample_bit_depth_chroma_minus1 = r.u(4) as u8;
-        sps.log2_min_pcm_luma_coding_block_size_minus3 = r.ue()? as u8;
-        sps.log2_diff_max_min_pcm_luma_coding_block_size = r.ue()? as u8;
+        let min_pcm_minus3 = r.ue_max(2, "SPS log2_min_pcm_luma_coding_block_size_minus3")?;
+        let max_pcm_log2 = 5u32.min(ctb_log2 as u32);
+        if min_pcm_minus3 + 3 > max_pcm_log2 {
+            return Err(BitstreamError::invalid("SPS minimum PCM block exceeds CTB"));
+        }
+        sps.log2_min_pcm_luma_coding_block_size_minus3 = min_pcm_minus3 as u8;
+        sps.log2_diff_max_min_pcm_luma_coding_block_size = r.ue_max(
+            max_pcm_log2 - (min_pcm_minus3 + 3),
+            "SPS log2_diff_max_min_pcm_luma_coding_block_size",
+        )? as u8;
         sps.pcm_loop_filter_disabled_flag = r.u(1) != 0;
     }
     sps.num_short_term_ref_pic_sets = r.ue()?;
@@ -1778,10 +1812,34 @@ pub fn parse_sps_nal(nal: &[u8]) -> Result<HevcSps, BitstreamError> {
             "HEVC SPS multilayer/3D/SCC extension payloads not supported",
         ));
     }
+    r.finish_rbsp(sps.sps_extension_4bits != 0)?;
+    validate_sps_geometry(&sps)?;
     Ok(sps)
 }
 
+fn validate_sps_geometry(sps: &HevcSps) -> Result<(), BitstreamError> {
+    let width = u64::from(sps.pic_width_in_luma_samples);
+    let height = u64::from(sps.pic_height_in_luma_samples);
+    if width == 0 || height == 0 {
+        return Err(BitstreamError::invalid(
+            "SPS coded dimensions must be nonzero",
+        ));
+    }
+    if let Some(crop) = sps.conformance_window
+        && ((u64::from(crop.left) + u64::from(crop.right)) * u64::from(sps.sub_width_c()) >= width
+            || (u64::from(crop.top) + u64::from(crop.bottom)) * u64::from(sps.sub_height_c())
+                >= height)
+    {
+        return Err(BitstreamError::invalid(
+            "SPS conformance window exceeds coded picture",
+        ));
+    }
+    Ok(())
+}
+
 /// Parse a PPS NAL (with two-byte NAL header at index 0..1).
+/// Requires complete syntax and RBSP trailing bits. Unknown extension-data
+/// bits remain opaque when their extension flag is set.
 pub fn parse_pps_nal(nal: &[u8]) -> Result<HevcPps, BitstreamError> {
     if nal.len() < 2 {
         return Err(BitstreamError::unexpected_end(
@@ -1797,15 +1855,19 @@ pub fn parse_pps_nal(nal: &[u8]) -> Result<HevcPps, BitstreamError> {
     let rbsp = ebsp_to_rbsp(&nal[2..]);
     let mut r = BitReader::new(&rbsp);
     let mut pps = HevcPps {
-        pps_pic_parameter_set_id: r.ue()? as u8,
-        pps_seq_parameter_set_id: r.ue()? as u8,
+        pps_pic_parameter_set_id: r.ue_max(63, "PPS pps_pic_parameter_set_id")? as u8,
+        pps_seq_parameter_set_id: r.ue_max(15, "PPS pps_seq_parameter_set_id")? as u8,
         dependent_slice_segments_enabled_flag: r.u(1) != 0,
         output_flag_present_flag: r.u(1) != 0,
         num_extra_slice_header_bits: r.u(3) as u8,
         sign_data_hiding_enabled_flag: r.u(1) != 0,
         cabac_init_present_flag: r.u(1) != 0,
-        num_ref_idx_l0_default_active_minus1: r.ue()? as u8,
-        num_ref_idx_l1_default_active_minus1: r.ue()? as u8,
+        num_ref_idx_l0_default_active_minus1: r
+            .ue_max(14, "PPS num_ref_idx_l0_default_active_minus1")?
+            as u8,
+        num_ref_idx_l1_default_active_minus1: r
+            .ue_max(14, "PPS num_ref_idx_l1_default_active_minus1")?
+            as u8,
         init_qp_minus26: r.se()?,
         constrained_intra_pred_flag: r.u(1) != 0,
         transform_skip_enabled_flag: r.u(1) != 0,
@@ -1905,6 +1967,7 @@ pub fn parse_pps_nal(nal: &[u8]) -> Result<HevcPps, BitstreamError> {
             "HEVC PPS multilayer/3D/SCC extension payloads not supported",
         ));
     }
+    r.finish_rbsp(pps.pps_extension_4bits != 0)?;
     Ok(pps)
 }
 
@@ -2760,7 +2823,8 @@ pub fn write_vps_nal(vps: &HevcVps) -> Result<Vec<u8>, BitstreamError> {
 
 /// Parse a minimal IRAP slice-segment header (7.3.6.1). Only the
 /// fields needed to confirm the slice is intra-coded and to populate
-/// the HW backends' picture-info struct are read.
+/// the HW backends' picture-info struct are read. Returns `Unsupported`
+/// if a non-first segment needs a slice address wider than 32 bits.
 pub fn parse_slice_header_minimal(
     nal: &[u8],
     sps: &HevcSps,
@@ -2784,7 +2848,7 @@ pub fn parse_slice_header_minimal(
     if is_irap_slice {
         sh.no_output_of_prior_pics_flag = r.u(1) != 0;
     }
-    sh.slice_pic_parameter_set_id = r.ue()? as u8;
+    sh.slice_pic_parameter_set_id = r.ue_max(63, "slice_pic_parameter_set_id")? as u8;
 
     let dependent_slice_segment_flag =
         if !sh.first_slice_segment_in_pic_flag && pps.dependent_slice_segments_enabled_flag {
@@ -2815,7 +2879,12 @@ pub fn parse_slice_header_minimal(
         let pic_w_in_ctbs = sps.pic_width_in_luma_samples.div_ceil(ctb_size);
         let pic_h_in_ctbs = sps.pic_height_in_luma_samples.div_ceil(ctb_size);
         let total_ctbs = pic_w_in_ctbs as u64 * pic_h_in_ctbs as u64;
-        let bits = (64 - total_ctbs.leading_zeros()).min(32);
+        let bits = 64 - total_ctbs.saturating_sub(1).leading_zeros();
+        if bits > 32 {
+            return Err(BitstreamError::unsupported(
+                "slice_segment_address wider than 32 bits",
+            ));
+        }
         let _slice_segment_address = r.u(bits);
     }
 
@@ -2823,7 +2892,7 @@ pub fn parse_slice_header_minimal(
     for _ in 0..pps.num_extra_slice_header_bits {
         let _ = r.u(1);
     }
-    sh.slice_type = r.ue()? as u8;
+    sh.slice_type = r.ue_max(2, "slice_type")? as u8;
 
     if pps.output_flag_present_flag {
         let _pic_output_flag = r.u(1);
@@ -2842,6 +2911,9 @@ pub fn parse_slice_header_minimal(
         sh.slice_pic_order_cnt_lsb = 0;
     }
 
+    if r.bit_pos() > r.total_bits() {
+        return Err(BitstreamError::unexpected_end("minimal slice header"));
+    }
     sh.is_irap = is_irap_slice;
     // We deliberately do NOT keep parsing past this point. The HW
     // backends only need the fields above to populate the picture
@@ -3518,6 +3590,8 @@ mod tests {
         write_vps_prefix(&mut w);
         w.write_bit(1);
         w.write_ue(16).unwrap();
+        w.write_ue(0).unwrap(); // max_num_reorder_pics
+        w.write_ue(0).unwrap(); // max_latency_increase_plus1
         let mut nal = vec![NAL_TYPE_VPS << 1, 0x01];
         nal.extend_from_slice(&crate::nal::rbsp_to_ebsp(&w.finish()));
         assert!(matches!(

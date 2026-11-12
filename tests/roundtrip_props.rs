@@ -260,16 +260,15 @@ fn over_read_never_panics_and_zeros() {
 }
 
 #[test]
-fn ue_on_all_zero_run_returns_clean_error_or_zero() {
+fn ue_on_all_zero_run_returns_clean_error() {
     // An all-zero buffer: every bit is 0, so `ue` keeps seeing leading
-    // zeros until at_end(); it must terminate with either a clean Err
-    // (too many leading zeros) or a value, never a panic.
+    // zeros until at_end(); it must reject the missing terminator.
     for len in 0..=8usize {
         let bytes = vec![0u8; len];
         let mut r = BitReader::new(&bytes);
         match r.ue() {
-            Ok(_) => {}
-            Err(BitstreamError::InvalidData(_)) => {}
+            Ok(value) => panic!("unterminated ue returned {value}"),
+            Err(BitstreamError::InvalidData(_) | BitstreamError::UnexpectedEnd(_)) => {}
             Err(other) => panic!("unexpected ue error variant: {other:?}"),
         }
         // se delegates to ue and must likewise not panic.
@@ -287,8 +286,7 @@ fn empty_reader_is_safe() {
     assert_eq!(r.u(32), 0);
     assert_eq!(r.u64(64), 0);
     assert_eq!(r.read_bit(), 0);
-    // ue on an empty reader: no bits → leading_zeros == 0 → Ok(0).
-    assert_eq!(r.ue().unwrap(), 0);
+    assert!(matches!(r.ue(), Err(BitstreamError::UnexpectedEnd(_))));
 }
 
 /// Minimal LEB128 encoder used only to drive the round-trip test

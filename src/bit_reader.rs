@@ -8,9 +8,10 @@
 //! - `ue(v)` is the unsigned Exp-Golomb code from H.264 9.1 / H.265 9.2.
 //! - `se(v)` is the signed Exp-Golomb code from H.264 9.1.1 /
 //!   H.265 9.2.2.
-//! - Past-the-end reads silently yield zero bits. Callers wanting
-//!   strict EOF behaviour should compare [`BitReader::bit_pos`]
-//!   against `bytes.len() * 8` themselves.
+//! - Fixed-width past-the-end reads silently yield zero bits. Callers
+//!   wanting strict EOF behaviour should compare [`BitReader::bit_pos`]
+//!   against `bytes.len() * 8` themselves. Exp-Golomb reads instead
+//!   return `UnexpectedEnd` when the terminator or suffix is missing.
 
 use crate::BitstreamError;
 
@@ -157,33 +158,53 @@ impl<'a> BitReader<'a> {
 
     /// H.264 §7.2 / H.265 §7.2 / H.266 §7.2 `more_rbsp_data()`.
     ///
-    /// Returns `true` if there is at least one more RBSP data bit
-    /// before the `rbsp_trailing_bits()` marker. The marker is a `1`
-    /// bit (the `rbsp_stop_one_bit`) followed by zero or more `0`
-    /// bits up to the next byte boundary, sitting at the end of the
-    /// RBSP. The algorithm: search forward from the current position
-    /// for any `1` bit after the *next* `1` — if we find one, the
-    /// next `1` was not the stop marker and there is more data.
-    ///
-    /// Returns `false` once positioned at or past the stop bit, and
-    /// at end-of-stream.
+    /// Returns false at EOF or when the remaining bits are exactly a
+    /// stop-one bit followed by zero alignment bits. Zero-valued data
+    /// before that marker still counts as data. This does not validate
+    /// the marker; use [`Self::read_rbsp_trailing_bits`] to consume it.
     pub fn more_rbsp_data(&self) -> bool {
-        let total = self.total_bits();
-        if self.bit_pos >= total {
+        let remaining = self.bits_remaining();
+        if remaining == 0 {
             return false;
         }
-        let mut saw_one = false;
-        for p in self.bit_pos..total {
-            let b = (self.bytes[p / 8] >> (7 - (p % 8))) & 1;
-            if !saw_one {
-                if b == 1 {
-                    saw_one = true;
-                }
-            } else if b == 1 {
-                return true;
-            }
+        if remaining > 8 {
+            return true;
         }
-        false
+        self.peek_bits(remaining as u32) != 1 << (remaining - 1)
+    }
+
+    // Complete a parameter-set RBSP. Unknown extension-data bits may
+    // precede the final marker, but cannot replace the mandatory tail.
+    pub(crate) fn finish_rbsp(&mut self, extension_data: bool) -> Result<(), BitstreamError> {
+        if extension_data {
+            let last = self.bytes.last().copied().unwrap_or(0);
+            if last == 0 {
+                return Err(BitstreamError::invalid("RBSP has no final stop bit"));
+            }
+            let stop = self.total_bits() - 1 - last.trailing_zeros() as usize;
+            if self.bit_pos > stop {
+                return Err(BitstreamError::unexpected_end(
+                    "RBSP syntax overlaps trailing bits",
+                ));
+            }
+            self.skip(stop - self.bit_pos);
+        }
+        self.read_rbsp_trailing_bits()?;
+        if !self.at_end() {
+            return Err(BitstreamError::invalid("bytes after rbsp_trailing_bits"));
+        }
+        Ok(())
+    }
+
+    // Validate the raw value before callers narrow a syntax field.
+    pub(crate) fn ue_max(&mut self, max: u32, field: &str) -> Result<u32, BitstreamError> {
+        let value = self.ue()?;
+        if value > max {
+            return Err(BitstreamError::invalid(format!(
+                "{field}={value} exceeds {max}"
+            )));
+        }
+        Ok(value)
     }
 
     /// H.264 §7.3.2.11 / H.265 §7.3.2.11 / H.266 §7.3.10
@@ -219,38 +240,37 @@ impl<'a> BitReader<'a> {
     }
 
     /// Unsigned Exp-Golomb (`ue(v)`). H.264 9.1 / H.265 9.2.
-    /// Returns an error if 32 or more leading zeros are seen: the
-    /// largest representable `ue(v)` value is `u32::MAX - 1` (31 leading
-    /// zeros), so 32 leading zeros has no valid `u32` value and the
-    /// `1 << leadingZeros` term would overflow.
+    ///
+    /// Returns `UnexpectedEnd` if the terminating one or suffix is
+    /// incomplete. Returns `InvalidData` after 32 leading zero bits:
+    /// the largest supported value is `u32::MAX - 1` (31 leading zeros).
     pub fn ue(&mut self) -> Result<u32, BitstreamError> {
         let mut leading_zeros = 0u32;
-        while !self.at_end() && self.read_bit() == 0 {
+        loop {
+            if self.at_end() {
+                return Err(BitstreamError::unexpected_end(
+                    "ue(v): missing terminating one",
+                ));
+            }
+            if self.read_bit() != 0 {
+                break;
+            }
             leading_zeros += 1;
             if leading_zeros >= 32 {
-                return Err(BitstreamError::InvalidData(
-                    "ue(v): 32 or more leading zero bits".into(),
+                return Err(BitstreamError::invalid(
+                    "ue(v): 32 or more leading zero bits",
                 ));
             }
         }
-        // The loop can also exit by hitting end-of-stream after a run of
-        // zeros (every remaining bit was 0). Guard that path too so a
-        // 32-bit all-zero buffer can never reach the shift below with
-        // `leading_zeros == 32`.
-        if leading_zeros >= 32 {
-            return Err(BitstreamError::InvalidData(
-                "ue(v): 32 or more leading zero bits".into(),
-            ));
+        if self.bits_remaining() < leading_zeros as usize {
+            return Err(BitstreamError::unexpected_end("ue(v): incomplete suffix"));
         }
-        if leading_zeros == 0 {
-            Ok(0)
-        } else {
-            let suffix = self.u(leading_zeros);
-            Ok((1u32 << leading_zeros) - 1 + suffix)
-        }
+        let suffix = self.u(leading_zeros);
+        Ok((1u32 << leading_zeros) - 1 + suffix)
     }
 
     /// Signed Exp-Golomb (`se(v)`). H.264 9.1.1 / H.265 9.2.2.
+    /// Returns the same errors for incomplete or oversized codes as [`Self::ue`].
     pub fn se(&mut self) -> Result<i32, BitstreamError> {
         let code = self.ue()?;
         if code == 0 {

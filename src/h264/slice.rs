@@ -241,9 +241,11 @@ impl SliceHeader {
         sps.mb_adaptive_frame_field_flag && !self.field_pic_flag
     }
 
-    /// `SliceQPY` (eq. 7-30).
+    /// `SliceQPY` (eq. 7-30). Hand-built invalid fields whose sum
+    /// exceeds i32 saturate; parsers reject out-of-range QP values.
     pub fn slice_qp_y(&self, pps: &H264Pps) -> i32 {
-        26 + pps.pic_init_qp_minus26 + self.slice_qp_delta
+        let qp = 26 + i64::from(pps.pic_init_qp_minus26) + i64::from(self.slice_qp_delta);
+        qp.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
     }
 
     /// `CurrPicNum` (§7.4.3): `frame_num` for frames, `2 * frame_num + 1`
@@ -445,9 +447,9 @@ pub fn parse_slice_header(
         }
     }
     h.slice_qp_delta = r.se()?;
-    let qp = h.slice_qp_y(pps);
+    let qp = 26 + i64::from(pps.pic_init_qp_minus26) + i64::from(h.slice_qp_delta);
     let qp_min = -6 * i32::from(sps.bit_depth_luma_minus8);
-    if !(qp_min..=51).contains(&qp) {
+    if !(i64::from(qp_min)..=51).contains(&qp) {
         return Err(BitstreamError::invalid(format!(
             "SliceQPY={qp} outside {qp_min}..=51"
         )));

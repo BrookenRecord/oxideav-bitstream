@@ -735,6 +735,8 @@ pub struct H264IdrParse<'a> {
 /// Parse a SPS RBSP (the bytes *after* emulation-prevention stripping
 /// and *after* the NAL header byte).
 ///
+/// Rejects incomplete syntax, invalid field ranges, and malformed trailing bits.
+///
 /// Note: pass the RBSP payload, not the raw NAL. Use
 /// [`parse_sps_nal`] if you have a NAL with header byte at index 0.
 pub fn parse_sps(rbsp: &[u8]) -> Result<H264Sps, BitstreamError> {
@@ -752,15 +754,15 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<H264Sps, BitstreamError> {
         level_idc,
         ..H264Sps::default()
     };
-    sps.seq_parameter_set_id = r.ue()? as u8;
+    sps.seq_parameter_set_id = r.ue_max(31, "SPS seq_parameter_set_id")? as u8;
 
     if H264Sps::has_high_profile_extension(profile_idc) {
-        sps.chroma_format_idc = r.ue()? as u8;
+        sps.chroma_format_idc = r.ue_max(3, "SPS chroma_format_idc")? as u8;
         if sps.chroma_format_idc == 3 {
             sps.separate_colour_plane_flag = r.u(1) != 0;
         }
-        sps.bit_depth_luma_minus8 = r.ue()? as u8;
-        sps.bit_depth_chroma_minus8 = r.ue()? as u8;
+        sps.bit_depth_luma_minus8 = r.ue_max(6, "SPS bit_depth_luma_minus8")? as u8;
+        sps.bit_depth_chroma_minus8 = r.ue_max(6, "SPS bit_depth_chroma_minus8")? as u8;
         sps.qpprime_y_zero_transform_bypass_flag = r.u(1) != 0;
         let seq_scaling_matrix_present = r.u(1);
         if seq_scaling_matrix_present != 0 {
@@ -784,7 +786,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<H264Sps, BitstreamError> {
         )));
     }
     sps.log2_max_frame_num_minus4 = log2_max_frame_num_minus4 as u8;
-    sps.pic_order_cnt_type = r.ue()? as u8;
+    sps.pic_order_cnt_type = r.ue_max(2, "SPS pic_order_cnt_type")? as u8;
     match sps.pic_order_cnt_type {
         0 => {
             // §7.4.2.1.1 likewise constrains log2_max_pic_order_cnt_lsb_minus4
@@ -847,7 +849,38 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<H264Sps, BitstreamError> {
     if vui_parameters_present_flag != 0 {
         sps.vui = Some(parse_vui_parameters(&mut r)?);
     }
+    r.finish_rbsp(false)?;
+    validate_sps_geometry(&sps)?;
     Ok(sps)
+}
+
+// Validate in a wide domain before exposing the u32 dimension helpers.
+fn validate_sps_geometry(sps: &H264Sps) -> Result<(), BitstreamError> {
+    let width = (u64::from(sps.pic_width_in_mbs_minus1) + 1) * 16;
+    let height = (u64::from(sps.pic_height_in_map_units_minus1) + 1)
+        * 16
+        * (2 - u64::from(sps.frame_mbs_only_flag));
+    if width > u64::from(u32::MAX) || height > u64::from(u32::MAX) {
+        return Err(BitstreamError::invalid("SPS coded dimensions exceed u32"));
+    }
+    if let Some(crop) = sps.frame_cropping {
+        let (cx, cy) = if sps.chroma_array_type() == 0 {
+            (1, 2 - u64::from(sps.frame_mbs_only_flag))
+        } else {
+            (
+                u64::from(sps.sub_width_c()),
+                u64::from(sps.sub_height_c()) * (2 - u64::from(sps.frame_mbs_only_flag)),
+            )
+        };
+        if (u64::from(crop.left) + u64::from(crop.right)) * cx >= width
+            || (u64::from(crop.top) + u64::from(crop.bottom)) * cy >= height
+        {
+            return Err(BitstreamError::invalid(
+                "SPS cropping exceeds coded picture",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Parse a SPS NAL — including the NAL header byte at index 0. Errors
@@ -868,6 +901,8 @@ pub fn parse_sps_nal(nal: &[u8]) -> Result<H264Sps, BitstreamError> {
 
 /// Parse a PPS RBSP (after emulation-prevention stripping and after
 /// the NAL header byte).
+///
+/// Requires a complete RBSP including its trailing bits.
 ///
 /// PPS scaling lists (`pic_scaling_matrix_present_flag == 1`) are
 /// refused by this context-free entry point because the §7.3.2.2
@@ -891,8 +926,8 @@ fn parse_pps_inner(rbsp: &[u8], sps: Option<&H264Sps>) -> Result<H264Pps, Bitstr
     }
     let mut r = BitReader::new(rbsp);
     let mut pps = H264Pps {
-        pic_parameter_set_id: r.ue()? as u8,
-        seq_parameter_set_id: r.ue()? as u8,
+        pic_parameter_set_id: r.ue_max(255, "PPS pic_parameter_set_id")? as u8,
+        seq_parameter_set_id: r.ue_max(31, "PPS seq_parameter_set_id")? as u8,
         entropy_coding_mode_flag: r.u(1) != 0,
         bottom_field_pic_order_in_frame_present_flag: r.u(1) != 0,
         num_slice_groups_minus1: r.ue()?,
@@ -903,8 +938,10 @@ fn parse_pps_inner(rbsp: &[u8], sps: Option<&H264Sps>) -> Result<H264Pps, Bitstr
             "PPS num_slice_groups_minus1>0 (FMO/ASO) not supported by minimal parser",
         ));
     }
-    pps.num_ref_idx_l0_default_active_minus1 = r.ue()? as u8;
-    pps.num_ref_idx_l1_default_active_minus1 = r.ue()? as u8;
+    pps.num_ref_idx_l0_default_active_minus1 =
+        r.ue_max(31, "PPS num_ref_idx_l0_default_active_minus1")? as u8;
+    pps.num_ref_idx_l1_default_active_minus1 =
+        r.ue_max(31, "PPS num_ref_idx_l1_default_active_minus1")? as u8;
     pps.weighted_pred_flag = r.u(1) != 0;
     pps.weighted_bipred_idc = r.u(2) as u8;
     pps.pic_init_qp_minus26 = r.se()?;
@@ -938,6 +975,7 @@ fn parse_pps_inner(rbsp: &[u8], sps: Option<&H264Sps>) -> Result<H264Pps, Bitstr
     } else {
         pps.second_chroma_qp_index_offset = pps.chroma_qp_index_offset;
     }
+    r.finish_rbsp(false)?;
     Ok(pps)
 }
 
@@ -984,8 +1022,8 @@ pub fn parse_slice_header_minimal(
     let mut r = BitReader::new(rbsp);
     let mut sh = H264SliceHeader {
         first_mb_in_slice: r.ue()?,
-        slice_type: r.ue()? as u8,
-        pic_parameter_set_id: r.ue()? as u8,
+        slice_type: r.ue_max(9, "slice slice_type")? as u8,
+        pic_parameter_set_id: r.ue_max(255, "slice pic_parameter_set_id")? as u8,
         ..H264SliceHeader::default()
     };
     if sps.separate_colour_plane_flag {
@@ -1008,6 +1046,9 @@ pub fn parse_slice_header_minimal(
     // pred_weight_table, dec_ref_pic_marking, slice_qp_delta, …) are
     // not needed to identify an IDR or to populate the IDR-only
     // parameter buffer, so we stop here.
+    if r.bit_pos() > r.total_bits() {
+        return Err(BitstreamError::unexpected_end("minimal slice header"));
+    }
     Ok(sh)
 }
 
@@ -1655,6 +1696,15 @@ mod tests {
         w.write_ue(0).unwrap(); // seq_parameter_set_id
         w.write_ue(log2_max_frame_num_minus4).unwrap();
         w.write_ue(2).unwrap(); // pic_order_cnt_type = 2 (no extra POC fields)
+        w.write_ue(1).unwrap(); // max_num_ref_frames
+        w.write_bit(0); // gaps_in_frame_num_value_allowed_flag
+        w.write_ue(19).unwrap(); // pic_width_in_mbs_minus1
+        w.write_ue(14).unwrap(); // pic_height_in_map_units_minus1
+        w.write_bit(1); // frame_mbs_only_flag
+        w.write_bit(1); // direct_8x8_inference_flag
+        w.write_bit(0); // frame_cropping_flag
+        w.write_bit(0); // vui_parameters_present_flag
+        w.write_rbsp_trailing_bits();
         w.finish()
     }
 
